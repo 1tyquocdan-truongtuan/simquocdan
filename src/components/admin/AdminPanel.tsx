@@ -67,7 +67,14 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       if (rows.length < 2) return;
 
       const headers = rows[0].map((h: any) => String(h).toLowerCase());
-      const phoneCol = headers.findIndex((h: string) => h.includes('số') || h.includes('phone') || h.includes('sim') || h.includes('sdt'));
+      // Tìm cột phone qua header keyword trước
+      let phoneCol = headers.findIndex((h: string) => h.includes('số') || h.includes('phone') || h.includes('sim') || h.includes('sdt'));
+      // Nếu không tìm được qua header, scan dòng đầu tiên để tìm cột có số điện thoại hợp lệ
+      if (phoneCol < 0 && rows.length > 1) {
+        for (let c = 0; c < rows[1].length; c++) {
+          if (normalizePhone(rows[1][c])) { phoneCol = c; break; }
+        }
+      }
       const batchName = file.name.replace(/\.[^.]+$/, '');
 
       // Cần bảng giá để auto-price
@@ -105,8 +112,9 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       const result = await upsertSims(entries);
       setImportResult({ ...result, total: entries.length });
       await loadData();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Import error:', err);
+      alert('Lỗi import: ' + (err?.message || JSON.stringify(err)));
     } finally {
       setLoading(false);
       e.target.value = '';
