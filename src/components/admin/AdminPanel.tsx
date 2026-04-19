@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { LogOut, LayoutDashboard, Smartphone, ShoppingBag, Tag, DollarSign, Upload, Trash2, Edit2, Save, X, RefreshCw, CheckCircle, AlertCircle } from 'lucide-react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { LogOut, LayoutDashboard, Smartphone, ShoppingBag, Tag, DollarSign, Upload, Trash2, Edit2, Save, X, RefreshCw, CheckCircle, AlertCircle, Menu, ChevronUp, ChevronDown } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { supabase } from '../../lib/supabase';
 import { normalizePhone, analyzeSim, getMenhAndColor, formatPhoneDisplay } from '../../utils/simLogic';
@@ -8,6 +8,7 @@ import type { SimEntry, Order, OrderStatus, PriceConfig } from '../../types';
 
 interface AdminPanelProps { onLogout: () => void; }
 type Tab = 'dashboard' | 'sims' | 'orders' | 'promotions' | 'price_config';
+type SortCol = 'phone' | 'price' | 'status' | 'network';
 
 const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   pending: 'Chờ xác nhận', confirmed: 'Đã xác nhận',
@@ -19,6 +20,41 @@ const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
   cancelled: 'bg-red-100 text-red-700',
 };
 
+// ─── Helpers (outside component) ─────────────────────────────────────────────
+
+const stripVI = (s: string) =>
+  s.toLowerCase().trim()
+    .replace(/[àáạảãăắặẳẵằâấậẩẫ]/g, 'a')
+    .replace(/[èéẹẻẽêếệểễề]/g, 'e')
+    .replace(/[ìíịỉĩ]/g, 'i')
+    .replace(/[òóọỏõôốộổỗồơớợởỡờ]/g, 'o')
+    .replace(/[ùúụủũưứựửữừ]/g, 'u')
+    .replace(/[ỳýỵỷỹ]/g, 'y')
+    .replace(/[đ]/g, 'd');
+
+const findPhoneCol = (rows: any[][]): { headerRow: number; phoneCol: number } => {
+  // Ưu tiên: tìm hàng header chứa tên cột SĐT
+  for (let r = 0; r < Math.min(15, rows.length); r++) {
+    const headers = (rows[r] || []).map((h: any) => stripVI(String(h ?? '')));
+    const col = headers.findIndex((h: string) =>
+      h.includes('isdn') || h.includes('sdt') || h.includes('so dt') ||
+      h.includes('dien thoai') || h.includes('phone') || h.includes('mobile') ||
+      h.includes('tel') || h === 'sim' ||
+      (h.includes('so') && !h.includes('stt') && !h.includes('so luong') && !h.includes('so thu') && !h.includes('iso'))
+    );
+    if (col >= 0) return { headerRow: r, phoneCol: col };
+  }
+  // Fallback: scan data để tìm cột có giá trị SĐT hợp lệ
+  for (let r = 0; r < Math.min(15, rows.length); r++) {
+    for (let c = 0; c < (rows[r] || []).length; c++) {
+      if (normalizePhone(rows[r][c])) return { headerRow: r - 1, phoneCol: c };
+    }
+  }
+  return { headerRow: -1, phoneCol: -1 };
+};
+
+// ─── Component ─────────────────────────────────────────────────────────────────
+
 export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const [tab, setTab] = useState<Tab>('dashboard');
   const [sims, setSims] = useState<SimEntry[]>([]);
@@ -26,7 +62,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const [promotions, setPromotions] = useState<any[]>([]);
   const [priceConfig, setPriceConfig] = useState<PriceConfig[]>([]);
   const [loading, setLoading] = useState(false);
-  const [importResult, setImportResult] = useState<{ inserted: number; skipped: number; total: number } | null>(null);
+  const [importResult, setImportResult] = useState<{ inserted: number; skipped: number; total: number; sheets: number } | null>(null);
   const [editPriceId, setEditPriceId] = useState<number | null>(null);
   const [editPrice, setEditPrice] = useState('');
   const [editPriceConfigId, setEditPriceConfigId] = useState<number | null>(null);
@@ -34,8 +70,21 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const [editPrice09, setEditPrice09] = useState('');
   const [promoTitle, setPromoTitle] = useState('');
   const [promoDesc, setPromoDesc] = useState('');
+  // SIM filters
   const [simFilter, setSimFilter] = useState<'all' | 'available' | 'sold' | 'reserved'>('all');
   const [simSearch, setSimSearch] = useState('');
+  const [networkFilter, setNetworkFilter] = useState<'all' | '03' | '09' | '08'>('all');
+  const [menhFilter, setMenhFilter] = useState('');
+  // Sort
+  const [sortCol, setSortCol] = useState<SortCol>('phone');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  // Pagination
+  const [simPage, setSimPage] = useState(1);
+  const SIM_PAGE_SIZE = 50;
+  // Multi-select
+  const [selectedSims, setSelectedSims] = useState<Set<number>>(new Set());
+  // Mobile sidebar
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const loadData = useCallback(async () => {
     const [simData, orderData, promoData, pcData] = await Promise.all([
@@ -52,7 +101,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // ─── Import Excel ────────────────────────────────────────────────────────────
+  // ─── Import Excel (đọc TẤT CẢ sheet) ────────────────────────────────────────
   const handleExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -61,95 +110,60 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
     try {
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { type: 'array' });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
-
-      if (rows.length < 2) {
-        alert('File Excel trống hoặc không có dữ liệu!');
-        return;
-      }
-
-      // Chuẩn hóa header: bỏ dấu tiếng Việt, thường hóa, trim
-      const stripVI = (s: string) =>
-        s.toLowerCase().trim()
-          .replace(/[àáạảãăắặẳẵằâấậẩẫ]/g, 'a')
-          .replace(/[èéẹẻẽêếệểễề]/g, 'e')
-          .replace(/[ìíịỉĩ]/g, 'i')
-          .replace(/[òóọỏõôốộổỗồơớợởỡờ]/g, 'o')
-          .replace(/[ùúụủũưứựửữừ]/g, 'u')
-          .replace(/[ỳýỵỷỹ]/g, 'y')
-          .replace(/[đ]/g, 'd');
-
-      const headers = rows[0].map((h: any) => stripVI(String(h)));
-      // Nhận diện cột SĐT: "SỐ ISDN", "SĐT", "Số điện thoại", "Phone", "SIM", "Tel", ...
-      let phoneCol = headers.findIndex((h: string) =>
-        h.includes('isdn') || h.includes('sdt') || h.includes('so dt') ||
-        h.includes('dien thoai') || h.includes('phone') || h.includes('mobile') ||
-        h.includes('tel') || h.includes('sim') ||
-        (h.includes('so') && !h.includes('stt') && !h.includes('so luong') && !h.includes('so thu'))
-      );
-
-      // Fallback: scan tối đa 10 dòng đầu để tìm cột có số hợp lệ
-      if (phoneCol < 0) {
-        outer: for (let r = 1; r <= Math.min(10, rows.length - 1); r++) {
-          for (let c = 0; c < (rows[r] || []).length; c++) {
-            if (normalizePhone(rows[r][c])) { phoneCol = c; break outer; }
-          }
-        }
-      }
-
-      if (phoneCol < 0) {
-        alert('Không tìm thấy cột số điện thoại!\n\nFile cần có cột tiêu đề chứa "SỐ ISDN", "SĐT", "Phone", "SIM"\nhoặc cột chứa số điện thoại 9–11 chữ số.');
-        return;
-      }
 
       const batchName = file.name.replace(/\.[^.]+$/, '');
       const config = priceConfig.length > 0 ? priceConfig : await fetchPriceConfig();
       if (config.length > 0 && priceConfig.length === 0) setPriceConfig(config);
 
-      const entries: Parameters<typeof upsertSims>[0] = [];
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row || row.every((c: any) => c == null || c === '')) continue;
-        const raw = row[phoneCol];
-        const phone = normalizePhone(raw);
-        if (!phone) continue;
+      const allEntries: Parameters<typeof upsertSims>[0] = [];
+      const seenPhones = new Set<string>(); // dedup qua nhiều sheet
+      let sheetsProcessed = 0;
 
-        const { types, detail } = analyzeSim(phone);
-        const { menh, color } = getMenhAndColor(phone);
-        const network = detectNetwork(phone);
-        const primaryType = getPrimaryType(types);
-        const price = lookupPrice(primaryType, network, config);
+      for (const sheetName of wb.SheetNames) {
+        const ws = wb.Sheets[sheetName];
+        const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+        if (!rows || rows.length < 2) continue;
 
-        entries.push({
-          phone,
-          original_phone: String(raw),
-          network,
-          price,
-          sim_types: types as string[],
-          primary_type: primaryType as string,
-          menh,
-          menh_color: color,
-          unit_advance_detail: detail || '',
-          batch: batchName,
-        });
+        const { headerRow, phoneCol } = findPhoneCol(rows);
+        if (phoneCol < 0) continue; // sheet này không có cột SĐT
+        sheetsProcessed++;
+
+        const dataStart = Math.max(1, headerRow + 1);
+        for (let i = dataStart; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.every((c: any) => c == null || c === '')) continue;
+          const raw = row[phoneCol];
+          const phone = normalizePhone(raw);
+          if (!phone || seenPhones.has(phone)) continue;
+          seenPhones.add(phone);
+
+          const { types, detail } = analyzeSim(phone);
+          const { menh, color } = getMenhAndColor(phone);
+          const network = detectNetwork(phone);
+          const primaryType = getPrimaryType(types);
+          const price = lookupPrice(primaryType, network, config);
+
+          allEntries.push({
+            phone, original_phone: String(raw ?? ''), network, price,
+            sim_types: types as string[], primary_type: primaryType as string,
+            menh, menh_color: color, unit_advance_detail: detail || '', batch: batchName,
+          });
+        }
       }
 
-      if (entries.length === 0) {
-        const colName = rows[0]?.[phoneCol] ?? `Cột ${phoneCol + 1}`;
-        alert(`Không tìm thấy số điện thoại hợp lệ!\n\nĐã đọc cột "${colName}" nhưng không có số nào hợp lệ.\n\nĐịnh dạng được chấp nhận:\n• 9 số (không có số 0 đầu): 326225574\n• 10 số: 0326225574\n• 11 số (số bàn): 02376502929\n• 10 số (số bàn không số 0): 2376502929`);
+      if (allEntries.length === 0) {
+        alert(`Không tìm thấy SĐT hợp lệ!\nFile có ${wb.SheetNames.length} sheet, ${sheetsProcessed} sheet có cột số điện thoại.\n\nĐịnh dạng chấp nhận: 9 số, 10 số, 11 số (số bàn).`);
         return;
       }
 
-      // Upload theo từng lô 100 để tránh timeout
       let totalInserted = 0;
-      const BATCH = 100;
-      for (let i = 0; i < entries.length; i += BATCH) {
-        const r = await upsertSims(entries.slice(i, i + BATCH));
+      for (let i = 0; i < allEntries.length; i += 100) {
+        const r = await upsertSims(allEntries.slice(i, i + 100));
         totalInserted += r.inserted;
       }
 
-      setImportResult({ inserted: totalInserted, skipped: entries.length - totalInserted, total: entries.length });
+      setImportResult({ inserted: totalInserted, skipped: allEntries.length - totalInserted, total: allEntries.length, sheets: sheetsProcessed });
+      setSelectedSims(new Set());
       await loadData();
     } catch (err: any) {
       console.error('Import error:', err);
@@ -163,10 +177,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   // ─── SIM Actions ─────────────────────────────────────────────────────────────
   const saveSimPrice = async (sim: SimEntry) => {
     const numPrice = parseInt(editPrice.replace(/[^0-9]/g, ''));
-    if (!isNaN(numPrice)) {
-      await updateSimPrice(sim.id, numPrice);
-      await loadData();
-    }
+    if (!isNaN(numPrice)) { await updateSimPrice(sim.id, numPrice); await loadData(); }
     setEditPriceId(null);
   };
 
@@ -178,17 +189,45 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const handleDeleteSim = async (id: number) => {
     if (!confirm('Xoá SIM này?')) return;
     await deleteSimService(id);
+    setSelectedSims(prev => { const n = new Set(prev); n.delete(id); return n; });
     await loadData();
   };
 
-  // ─── Price Config Actions ─────────────────────────────────────────────────────
+  const deleteSelected = async () => {
+    if (selectedSims.size === 0) return;
+    if (!confirm(`Xoá ${selectedSims.size} SIM đã chọn?`)) return;
+    const ids = Array.from(selectedSims);
+    for (let i = 0; i < ids.length; i += 50)
+      await supabase.from('sims').delete().in('id', ids.slice(i, i + 50));
+    setSelectedSims(new Set());
+    await loadData();
+  };
+
+  const deleteAll = async () => {
+    if (sims.length === 0) return;
+    if (!confirm(`⚠️ XOÁ TOÀN BỘ ${sims.length} SIM trong kho?\nHành động này KHÔNG THỂ HOÀN TÁC!`)) return;
+    const ans = prompt('Nhập "XOACHET" để xác nhận:');
+    if (ans !== 'XOACHET') { alert('Xác nhận sai. Đã huỷ.'); return; }
+    await supabase.from('sims').delete().gte('id', 0);
+    setSelectedSims(new Set());
+    await loadData();
+  };
+
+  // ─── Sort ─────────────────────────────────────────────────────────────────
+  const toggleSort = (col: SortCol) => {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortCol(col); setSortDir('asc'); }
+    setSimPage(1);
+  };
+
+  // ─── Price Config ─────────────────────────────────────────────────────────
   const savePriceConfig = async (id: number) => {
     await updatePriceConfig(id, parseInt(editPrice03) || 0, parseInt(editPrice09) || 0);
     setPriceConfig(await fetchPriceConfig());
     setEditPriceConfigId(null);
   };
 
-  // ─── Other ───────────────────────────────────────────────────────────────────
+  // ─── Orders & Promotions ──────────────────────────────────────────────────
   const updateOrderStatus = async (id: string, status: OrderStatus) => {
     await supabase.from('orders').update({ status, updated_at: new Date().toISOString() }).eq('id', id);
     const { data } = await supabase.from('orders').select('*').order('created_at', { ascending: false });
@@ -208,13 +247,46 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
     setPromotions(p => p.filter(x => x.id !== id));
   };
 
-  // ─── Filtered SIMs ────────────────────────────────────────────────────────────
-  const filteredSims = sims.filter(s => {
-    if (simFilter !== 'all' && s.status !== simFilter) return false;
-    if (simSearch && !s.normalizedPhone.includes(simSearch.replace(/[^0-9]/g, ''))) return false;
-    return true;
-  });
+  // ─── Filtered + Sorted SIMs ──────────────────────────────────────────────
+  const filteredSims = useMemo(() => {
+    let result = sims.filter(s => {
+      if (simFilter !== 'all' && s.status !== simFilter) return false;
+      if (networkFilter !== 'all' && s.network !== networkFilter) return false;
+      if (menhFilter && s.menh !== menhFilter) return false;
+      if (simSearch) {
+        const q = simSearch.replace(/[^0-9]/g, '');
+        if (q && !s.normalizedPhone.includes(q)) return false;
+        if (!q && !s.normalizedPhone.includes(simSearch)) return false;
+      }
+      return true;
+    });
+    return [...result].sort((a, b) => {
+      let cmp = 0;
+      if (sortCol === 'phone') cmp = a.normalizedPhone.localeCompare(b.normalizedPhone);
+      else if (sortCol === 'price') {
+        cmp = (parseInt((a.price || '0').replace(/[^0-9]/g, '')) || 0) -
+              (parseInt((b.price || '0').replace(/[^0-9]/g, '')) || 0);
+      }
+      else if (sortCol === 'status') cmp = (a.status || '').localeCompare(b.status || '');
+      else if (sortCol === 'network') cmp = (a.network || '').localeCompare(b.network || '');
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+  }, [sims, simFilter, networkFilter, menhFilter, simSearch, sortCol, sortDir]);
 
+  const totalPages = Math.ceil(filteredSims.length / SIM_PAGE_SIZE);
+  const pagedSims = filteredSims.slice((simPage - 1) * SIM_PAGE_SIZE, simPage * SIM_PAGE_SIZE);
+  const allPageSelected = pagedSims.length > 0 && pagedSims.every(s => selectedSims.has(s.id));
+
+  const toggleSelectAll = () => {
+    setSelectedSims(prev => {
+      const n = new Set(prev);
+      if (allPageSelected) pagedSims.forEach(s => n.delete(s.id));
+      else pagedSims.forEach(s => n.add(s.id));
+      return n;
+    });
+  };
+
+  // ─── UI helpers ─────────────────────────────────────────────────────────────
   const tabs: { id: Tab; icon: any; label: string }[] = [
     { id: 'dashboard', icon: LayoutDashboard, label: 'Tổng quan' },
     { id: 'sims', icon: Smartphone, label: 'Kho SIM' },
@@ -223,369 +295,471 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
     { id: 'promotions', icon: Tag, label: 'Khuyến mãi' },
   ];
 
+  const SortTh = ({ col, label, className = '' }: { col: SortCol; label: string; className?: string }) => (
+    <th onClick={() => toggleSort(col)}
+      className={`px-3 py-3 text-left text-xs font-bold text-gray-500 uppercase cursor-pointer select-none whitespace-nowrap ${className}`}>
+      <span className="inline-flex items-center gap-0.5">
+        {label}
+        <span className="inline-flex flex-col ml-0.5">
+          <ChevronUp size={9} className={sortCol === col && sortDir === 'asc' ? 'text-[#ee0033]' : 'text-gray-300'} />
+          <ChevronDown size={9} className={sortCol === col && sortDir === 'desc' ? 'text-[#ee0033]' : 'text-gray-300'} />
+        </span>
+      </span>
+    </th>
+  );
+
+  const navTo = (t: Tab) => { setTab(t); setSidebarOpen(false); };
+
+  // ─── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-100 flex">
+
+      {/* Overlay mobile */}
+      {sidebarOpen && (
+        <div className="fixed inset-0 bg-black/50 z-30 md:hidden" onClick={() => setSidebarOpen(false)} />
+      )}
+
       {/* Sidebar */}
-      <div className="fixed left-0 top-0 h-full w-56 bg-[#ee0033] shadow-xl z-40 flex flex-col">
-        <div className="p-5 border-b border-red-400">
-          <div className="text-white font-black text-lg">SIM QUỐC DÂN</div>
-          <div className="text-red-200 text-xs">Quản trị hệ thống</div>
+      <aside className={`fixed left-0 top-0 h-full w-56 bg-[#ee0033] shadow-xl z-40 flex flex-col
+        transition-transform duration-300 ease-in-out
+        ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+        <div className="p-4 border-b border-red-400 flex items-center justify-between">
+          <div>
+            <div className="text-white font-black text-base leading-tight">SIM QUỐC DÂN</div>
+            <div className="text-red-200 text-xs">Quản trị hệ thống</div>
+          </div>
+          <button onClick={() => setSidebarOpen(false)} className="md:hidden text-red-200 hover:text-white p-1">
+            <X size={18} />
+          </button>
         </div>
-        <nav className="p-3 space-y-1 flex-1">
+        <nav className="p-3 space-y-1 flex-1 overflow-y-auto">
           {tabs.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)}
-              className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-semibold transition-colors ${tab === t.id ? 'bg-white text-[#ee0033]' : 'text-red-100 hover:bg-white/10'}`}>
-              <t.icon size={18} />{t.label}
+            <button key={t.id} onClick={() => navTo(t.id)}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors
+                ${tab === t.id ? 'bg-white text-[#ee0033]' : 'text-red-100 hover:bg-white/10'}`}>
+              <t.icon size={17} />{t.label}
             </button>
           ))}
         </nav>
-        <div className="p-3">
-          <button onClick={onLogout} className="w-full flex items-center gap-3 px-4 py-3 text-red-200 hover:text-white hover:bg-white/10 rounded-xl text-sm font-semibold transition-colors">
-            <LogOut size={18} />Đăng xuất
+        <div className="p-3 border-t border-red-400">
+          <button onClick={onLogout}
+            className="w-full flex items-center gap-3 px-4 py-2.5 text-red-200 hover:text-white hover:bg-white/10 rounded-xl text-sm font-semibold transition-colors">
+            <LogOut size={17} />Đăng xuất
           </button>
         </div>
-      </div>
+      </aside>
 
-      {/* Main */}
-      <div className="ml-56 flex-1 p-6">
+      {/* Main area */}
+      <div className="flex-1 md:ml-56 min-w-0 flex flex-col">
 
-        {/* ── DASHBOARD ── */}
-        {tab === 'dashboard' && (
-          <div>
-            <h1 className="text-2xl font-black text-gray-800 mb-6">Tổng quan</h1>
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-              {[
-                { label: 'Tổng SIM', value: sims.length, bg: 'bg-blue-50', text: 'text-blue-600', bar: 'bg-blue-500', icon: '📱' },
-                { label: 'Đang bán', value: sims.filter(s => s.status === 'available').length, bg: 'bg-green-50', text: 'text-green-600', bar: 'bg-green-500', icon: '✅' },
-                { label: 'Đã bán', value: sims.filter(s => s.status === 'sold').length, bg: 'bg-gray-50', text: 'text-gray-600', bar: 'bg-gray-400', icon: '📦' },
-                { label: 'Đơn chờ', value: orders.filter(o => o.status === 'pending').length, bg: 'bg-red-50', text: 'text-[#ee0033]', bar: 'bg-[#ee0033]', icon: '🔔' },
-              ].map(stat => (
-                <div key={stat.label} className={`${stat.bg} rounded-2xl p-5 border border-white shadow-sm`}>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xl">{stat.icon}</span>
-                    <div className={`w-2 h-8 ${stat.bar} rounded-full`} />
-                  </div>
-                  <div className={`text-3xl font-black ${stat.text}`}>{stat.value}</div>
-                  <div className="text-gray-500 text-sm mt-1">{stat.label}</div>
-                </div>
-              ))}
-            </div>
-            <div className="bg-white rounded-2xl p-5 shadow-sm">
-              <h2 className="font-bold text-gray-700 mb-3">Đơn hàng gần đây</h2>
-              <div className="space-y-2">
-                {orders.slice(0, 5).map(order => (
-                  <div key={order.id} className="flex items-center justify-between py-2 border-b border-gray-100 last:border-0">
-                    <div>
-                      <div className="font-semibold text-gray-800">{order.sim_number}</div>
-                      <div className="text-xs text-gray-500">{order.customer_name} — {order.contact_phone}</div>
+        {/* Mobile topbar */}
+        <div className="md:hidden sticky top-0 z-20 flex items-center gap-3 bg-[#ee0033] px-4 py-3 shadow-md">
+          <button onClick={() => setSidebarOpen(true)} className="text-white p-1"><Menu size={20} /></button>
+          <span className="text-white font-black text-sm flex-1">
+            {tabs.find(t => t.id === tab)?.label ?? 'Admin'}
+          </span>
+          <button onClick={loadData} className="text-red-200 hover:text-white p-1"><RefreshCw size={16} /></button>
+        </div>
+
+        <div className="flex-1 p-3 md:p-6 overflow-x-hidden">
+
+          {/* ── DASHBOARD ── */}
+          {tab === 'dashboard' && (
+            <div>
+              <h1 className="text-xl md:text-2xl font-black text-gray-800 mb-4">Tổng quan</h1>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                {[
+                  { label: 'Tổng SIM', value: sims.length, bg: 'bg-blue-50', text: 'text-blue-600', bar: 'bg-blue-500', icon: '📱' },
+                  { label: 'Đang bán', value: sims.filter(s => s.status === 'available').length, bg: 'bg-green-50', text: 'text-green-600', bar: 'bg-green-500', icon: '✅' },
+                  { label: 'Đã bán', value: sims.filter(s => s.status === 'sold').length, bg: 'bg-gray-50', text: 'text-gray-600', bar: 'bg-gray-400', icon: '📦' },
+                  { label: 'Đơn chờ', value: orders.filter(o => o.status === 'pending').length, bg: 'bg-red-50', text: 'text-[#ee0033]', bar: 'bg-[#ee0033]', icon: '🔔' },
+                ].map(s => (
+                  <div key={s.label} className={`${s.bg} rounded-2xl p-4 shadow-sm`}>
+                    <div className="flex justify-between items-start mb-2">
+                      <span className="text-xl">{s.icon}</span>
+                      <div className={`w-1.5 h-8 ${s.bar} rounded-full`} />
                     </div>
-                    <span className={`px-2 py-1 rounded-full text-xs font-semibold ${ORDER_STATUS_COLORS[order.status]}`}>
-                      {ORDER_STATUS_LABELS[order.status]}
-                    </span>
+                    <div className={`text-3xl font-black ${s.text}`}>{s.value}</div>
+                    <div className="text-gray-500 text-xs mt-1">{s.label}</div>
                   </div>
                 ))}
-                {orders.length === 0 && <p className="text-gray-400 text-sm">Chưa có đơn hàng</p>}
+              </div>
+              <div className="bg-white rounded-2xl p-4 shadow-sm">
+                <h2 className="font-bold text-gray-700 mb-3 text-sm">Đơn hàng gần đây</h2>
+                <div className="space-y-2">
+                  {orders.slice(0, 5).map(order => (
+                    <div key={order.id} className="flex items-center justify-between py-2 border-b border-gray-100 last:border-0 gap-3">
+                      <div className="min-w-0">
+                        <div className="font-semibold text-gray-800 sim-number text-sm">{order.sim_number}</div>
+                        <div className="text-xs text-gray-400 truncate">{order.customer_name} · {order.contact_phone}</div>
+                      </div>
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-semibold shrink-0 ${ORDER_STATUS_COLORS[order.status]}`}>
+                        {ORDER_STATUS_LABELS[order.status]}
+                      </span>
+                    </div>
+                  ))}
+                  {orders.length === 0 && <p className="text-gray-400 text-sm text-center py-4">Chưa có đơn hàng</p>}
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* ── KHO SIM ── */}
-        {tab === 'sims' && (
-          <div>
-            <div className="flex items-center justify-between mb-4">
-              <h1 className="text-2xl font-black text-gray-800">Kho SIM <span className="text-gray-400 font-normal text-base">({sims.length} số)</span></h1>
-              <div className="flex items-center gap-2">
-                <button onClick={loadData} className="p-2 text-gray-500 hover:text-gray-700 transition-colors"><RefreshCw size={16} /></button>
-                <label className={`flex items-center gap-2 ${loading ? 'bg-gray-400' : 'bg-[#ee0033] hover:bg-[#cc0029]'} text-white px-4 py-2.5 rounded-xl cursor-pointer transition-colors text-sm font-semibold`}>
-                  <Upload size={16} />
+          {/* ── KHO SIM ── */}
+          {tab === 'sims' && (
+            <div>
+              {/* Header row */}
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <h1 className="text-lg md:text-xl font-black text-gray-800">
+                  Kho SIM <span className="text-gray-400 font-normal text-sm">({sims.length})</span>
+                </h1>
+                <div className="flex-1" />
+                <button onClick={loadData} className="p-2 text-gray-400 hover:text-gray-700 hidden md:block">
+                  <RefreshCw size={15} />
+                </button>
+                {selectedSims.size > 0 && (
+                  <button onClick={deleteSelected}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-red-100 text-red-700 hover:bg-red-200 rounded-xl text-xs font-bold transition-colors">
+                    <Trash2 size={13} /> Xoá {selectedSims.size} đã chọn
+                  </button>
+                )}
+                <button onClick={deleteAll}
+                  className="flex items-center gap-1.5 px-3 py-2 border border-red-200 text-red-400 hover:bg-red-50 rounded-xl text-xs font-semibold transition-colors">
+                  <Trash2 size={13} /> Xoá tất cả
+                </button>
+                <label className={`flex items-center gap-2 ${loading ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#ee0033] hover:bg-[#cc0029] cursor-pointer'} text-white px-4 py-2 rounded-xl transition-colors text-sm font-semibold`}>
+                  <Upload size={14} />
                   {loading ? 'Đang xử lý...' : 'Import Excel'}
                   <input type="file" accept=".xlsx,.xls,.csv" onChange={handleExcel} className="hidden" disabled={loading} />
                 </label>
               </div>
-            </div>
 
-            {/* Import result */}
-            {importResult && (
-              <div className={`flex items-center gap-3 px-4 py-3 rounded-xl mb-4 text-sm font-semibold border ${
-                importResult.inserted > 0
-                  ? 'bg-green-50 text-green-700 border-green-200'
-                  : importResult.total === 0
-                    ? 'bg-red-50 text-red-700 border-red-200'
-                    : 'bg-yellow-50 text-yellow-700 border-yellow-200'
-              }`}>
-                {importResult.inserted > 0 ? <CheckCircle size={18} /> : <AlertCircle size={18} />}
-                <span>
-                  {importResult.total === 0
-                    ? 'Không đọc được số điện thoại nào từ file'
-                    : <>Import xong: <strong>{importResult.inserted}</strong> số mới / <strong>{importResult.total}</strong> số trong file
-                      {importResult.skipped > 0 && <span className="font-normal text-current/70 ml-1">({importResult.skipped} số trùng → đã cập nhật)</span>}
-                    </>
-                  }
-                </span>
-                <button onClick={() => setImportResult(null)} className="ml-auto hover:opacity-60 transition-opacity"><X size={14} /></button>
-              </div>
-            )}
-
-            {/* Filters */}
-            <div className="flex gap-2 mb-4">
-              <input
-                type="tel" placeholder="Tìm số..." value={simSearch}
-                onChange={e => setSimSearch(e.target.value)}
-                className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#ee0033] w-48"
-              />
-              {(['all', 'available', 'sold', 'reserved'] as const).map(f => (
-                <button key={f} onClick={() => setSimFilter(f)}
-                  className={`px-3 py-2 rounded-xl text-xs font-semibold transition-colors ${simFilter === f ? 'bg-[#ee0033] text-white' : 'bg-white border border-gray-200 text-gray-600'}`}>
-                  {{ all: 'Tất cả', available: 'Đang bán', sold: 'Đã bán', reserved: 'Đang giữ' }[f]}
-                </button>
-              ))}
-            </div>
-
-            <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 border-b border-gray-200">
-                  <tr>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Số điện thoại</th>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Loại chính</th>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Mạng</th>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Mệnh</th>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Giá</th>
-                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Trạng thái</th>
-                    <th className="px-4 py-3 text-center text-xs font-bold text-gray-500 uppercase tracking-wide">Xoá</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {filteredSims.slice(0, 200).map(sim => (
-                    <tr key={sim.id} className="hover:bg-red-50/30 transition-colors">
-                      <td className="px-4 py-2.5 sim-number font-black text-[#ee0033] whitespace-nowrap text-sm">
-                        {formatPhoneDisplay(sim.normalizedPhone)}
-                      </td>
-                      <td className="px-4 py-2.5 max-w-[160px]">
-                        <div className="truncate text-xs text-gray-500">{sim.primaryType || sim.simTypes[0]}</div>
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${
-                          sim.network === '09' ? 'bg-purple-100 text-purple-700' :
-                          sim.network === '08' ? 'bg-pink-100 text-pink-700' :
-                          'bg-blue-100 text-blue-700'
-                        }`}>
-                          {sim.network === '09' ? 'Viettel/MB' : sim.network === '08' ? 'Vina' : 'Mobi/VT'}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <span className="text-xs font-bold px-2 py-0.5 rounded-full" style={{ color: sim.menhColor, backgroundColor: (sim.menhColor || '#999') + '18' }}>
-                          {sim.menh || '—'}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2.5">
-                        {editPriceId === sim.id ? (
-                          <div className="flex items-center gap-1">
-                            <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)}
-                              className="border rounded-lg px-2 py-1 text-xs w-24 focus:outline-none focus:border-[#ee0033]" autoFocus />
-                            <button onClick={() => saveSimPrice(sim)} className="text-green-500 hover:text-green-700"><Save size={14} /></button>
-                            <button onClick={() => setEditPriceId(null)} className="text-gray-400 hover:text-gray-600"><X size={14} /></button>
-                          </div>
-                        ) : (
-                          <button onClick={() => { setEditPriceId(sim.id); setEditPrice(sim.price?.replace(/[^0-9]/g, '') || ''); }}
-                            className="flex items-center gap-1 text-gray-800 hover:text-[#ee0033] font-bold text-xs group">
-                            {sim.price || '—'} <Edit2 size={10} className="opacity-0 group-hover:opacity-60 transition-opacity" />
-                          </button>
-                        )}
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <select value={sim.status || 'available'} onChange={e => handleStatusChange(sim, e.target.value as any)}
-                          className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-[#ee0033] bg-white cursor-pointer">
-                          <option value="available">🟢 Đang bán</option>
-                          <option value="reserved">🟡 Đang giữ</option>
-                          <option value="sold">⚫ Đã bán</option>
-                        </select>
-                      </td>
-                      <td className="px-4 py-2.5 text-center">
-                        <button onClick={() => handleDeleteSim(sim.id)} className="text-gray-200 hover:text-red-500 transition-colors">
-                          <Trash2 size={14} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredSims.length === 0 && (
-                    <tr><td colSpan={7} className="text-center py-16 text-gray-400">
-                      {sims.length === 0 ? (
-                        <div>
-                          <div className="text-5xl mb-3">📂</div>
-                          <div className="font-semibold text-gray-500 mb-1">Kho chưa có SIM</div>
-                          <div className="text-xs">Nhấn <strong>Import Excel</strong> để thêm SIM vào kho</div>
-                        </div>
-                      ) : (
-                        <div>
-                          <div className="text-3xl mb-2">🔍</div>
-                          <div className="text-gray-500 text-sm">Không có SIM phù hợp với bộ lọc</div>
-                        </div>
-                      )}
-                    </td></tr>
-                  )}
-                </tbody>
-              </table>
-              {filteredSims.length > 200 && (
-                <div className="px-4 py-3 bg-amber-50 border-t border-amber-100 text-xs text-amber-700 text-center font-semibold">
-                  Đang hiển thị 200/{filteredSims.length} số — dùng bộ lọc hoặc tìm kiếm để thu hẹp kết quả
+              {/* Import result */}
+              {importResult && (
+                <div className={`flex items-center gap-2 px-4 py-3 rounded-xl mb-3 text-sm border ${
+                  importResult.inserted > 0 ? 'bg-green-50 text-green-700 border-green-200'
+                  : importResult.total === 0 ? 'bg-red-50 text-red-700 border-red-200'
+                  : 'bg-yellow-50 text-yellow-700 border-yellow-200'}`}>
+                  {importResult.inserted > 0 ? <CheckCircle size={16} /> : <AlertCircle size={16} />}
+                  <span className="text-xs flex-1">
+                    {importResult.total === 0
+                      ? 'Không đọc được số điện thoại nào từ file'
+                      : <><strong>{importResult.sheets}</strong> sheet · <strong>{importResult.inserted}</strong> số mới / <strong>{importResult.total}</strong> tổng{importResult.skipped > 0 && <span className="opacity-70"> ({importResult.skipped} trùng → đã cập nhật)</span>}</>
+                    }
+                  </span>
+                  <button onClick={() => setImportResult(null)} className="hover:opacity-60"><X size={14} /></button>
                 </div>
               )}
-            </div>
-          </div>
-        )}
 
-        {/* ── ĐƠN HÀNG ── */}
-        {tab === 'orders' && (
-          <div>
-            <h1 className="text-2xl font-black text-gray-800 mb-6">Đơn hàng ({orders.length})</h1>
-            <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
-                  <tr>
-                    <th className="px-4 py-3 text-left">Số SIM</th>
-                    <th className="px-4 py-3 text-left">Khách hàng</th>
-                    <th className="px-4 py-3 text-left">SĐT liên hệ</th>
-                    <th className="px-4 py-3 text-left">Giá</th>
-                    <th className="px-4 py-3 text-left">Trạng thái</th>
-                    <th className="px-4 py-3 text-center">Cập nhật</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {orders.map(order => (
-                    <tr key={order.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 sim-number font-bold text-[#ee0033]">{order.sim_number}</td>
-                      <td className="px-4 py-3 font-semibold">{order.customer_name}</td>
-                      <td className="px-4 py-3 text-gray-600">{order.contact_phone}</td>
-                      <td className="px-4 py-3 font-semibold text-[#ee0033]">{order.sim_price}</td>
-                      <td className="px-4 py-3">
-                        <span className={`px-2 py-1 rounded-full text-xs font-semibold ${ORDER_STATUS_COLORS[order.status]}`}>
-                          {ORDER_STATUS_LABELS[order.status]}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <select value={order.status} onChange={e => updateOrderStatus(order.id, e.target.value as OrderStatus)}
-                          className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-[#ee0033]">
-                          {Object.entries(ORDER_STATUS_LABELS).map(([val, label]) => (
-                            <option key={val} value={val}>{label}</option>
-                          ))}
-                        </select>
-                      </td>
-                    </tr>
-                  ))}
-                  {orders.length === 0 && (
-                    <tr><td colSpan={6} className="text-center py-10 text-gray-400">Chưa có đơn hàng nào.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
+              {/* Filter bar */}
+              <div className="bg-white rounded-xl px-3 py-2.5 mb-3 shadow-sm flex flex-wrap gap-2 items-center">
+                <input type="tel" placeholder="🔍 Tìm số..." value={simSearch}
+                  onChange={e => { setSimSearch(e.target.value); setSimPage(1); }}
+                  className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-[#ee0033] w-32" />
 
-        {/* ── BẢNG GIÁ ── */}
-        {tab === 'price_config' && (
-          <div>
-            <div className="flex items-center justify-between mb-6">
-              <div>
-                <h1 className="text-2xl font-black text-gray-800">Bảng giá theo loại SIM</h1>
-                <p className="text-gray-500 text-sm mt-1">Sửa giá ở đây → tự động áp dụng cho lần import tiếp theo</p>
+                {(['all', 'available', 'sold', 'reserved'] as const).map(f => (
+                  <button key={f} onClick={() => { setSimFilter(f); setSimPage(1); }}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors ${simFilter === f ? 'bg-[#ee0033] text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                    {{ all: 'Tất cả', available: '🟢 Đang bán', sold: '⚫ Đã bán', reserved: '🟡 Đang giữ' }[f]}
+                  </button>
+                ))}
+
+                <select value={networkFilter} onChange={e => { setNetworkFilter(e.target.value as any); setSimPage(1); }}
+                  className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-[#ee0033] bg-white">
+                  <option value="all">Tất cả mạng</option>
+                  <option value="09">Viettel / MB</option>
+                  <option value="03">Mobi / Vina / Gmob</option>
+                  <option value="08">Vinaphone 08x</option>
+                </select>
+
+                <select value={menhFilter} onChange={e => { setMenhFilter(e.target.value); setSimPage(1); }}
+                  className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-[#ee0033] bg-white">
+                  <option value="">Tất cả mệnh</option>
+                  {['Kim', 'Mộc', 'Thủy', 'Hỏa', 'Thổ'].map(m => <option key={m}>{m}</option>)}
+                </select>
+
+                <span className="ml-auto text-xs text-gray-400 hidden md:block">
+                  {filteredSims.length}/{sims.length} kết quả
+                </span>
               </div>
-              <button onClick={() => fetchPriceConfig().then(setPriceConfig)} className="flex items-center gap-2 px-4 py-2 border border-gray-200 rounded-xl text-sm hover:bg-gray-50 transition-colors">
-                <RefreshCw size={14} /> Làm mới
-              </button>
-            </div>
-            <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
-                  <tr>
-                    <th className="px-4 py-3 text-left">Loại SIM</th>
-                    <th className="px-4 py-3 text-right">Giá mạng 03 (VNĐ)</th>
-                    <th className="px-4 py-3 text-right">Giá mạng 09/08 (VNĐ)</th>
-                    <th className="px-4 py-3 text-center">Sửa</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {priceConfig.map(pc => (
-                    <tr key={pc.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 font-semibold text-gray-800">{pc.sim_type}</td>
-                      <td className="px-4 py-3 text-right">
-                        {editPriceConfigId === pc.id ? (
-                          <input type="number" value={editPrice03} onChange={e => setEditPrice03(e.target.value)}
-                            className="border rounded-lg px-2 py-1 text-sm w-28 text-right focus:outline-none focus:border-[#ee0033]" autoFocus />
-                        ) : (
-                          <span className="text-gray-700">{pc.price_03.toLocaleString('vi-VN')}đ</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        {editPriceConfigId === pc.id ? (
-                          <input type="number" value={editPrice09} onChange={e => setEditPrice09(e.target.value)}
-                            className="border rounded-lg px-2 py-1 text-sm w-28 text-right focus:outline-none focus:border-[#ee0033]" />
-                        ) : (
-                          <span className="text-gray-700">{pc.price_09.toLocaleString('vi-VN')}đ</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        {editPriceConfigId === pc.id ? (
-                          <div className="flex items-center justify-center gap-2">
-                            <button onClick={() => savePriceConfig(pc.id)} className="text-green-500 hover:text-green-700"><Save size={16} /></button>
-                            <button onClick={() => setEditPriceConfigId(null)} className="text-gray-400 hover:text-gray-600"><X size={16} /></button>
-                          </div>
-                        ) : (
-                          <button onClick={() => { setEditPriceConfigId(pc.id); setEditPrice03(String(pc.price_03)); setEditPrice09(String(pc.price_09)); }}
-                            className="text-gray-400 hover:text-[#ee0033] transition-colors">
-                            <Edit2 size={15} />
+
+              {/* Table */}
+              <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm min-w-[560px]">
+                    <thead className="bg-gray-50 border-b border-gray-200">
+                      <tr>
+                        <th className="px-3 py-3 w-9">
+                          <input type="checkbox" checked={allPageSelected} onChange={toggleSelectAll}
+                            className="rounded border-gray-300 accent-[#ee0033] cursor-pointer" />
+                        </th>
+                        <SortTh col="phone" label="Số điện thoại" />
+                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-500 uppercase hidden lg:table-cell">Loại</th>
+                        <SortTh col="network" label="Mạng" />
+                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-500 uppercase hidden md:table-cell">Mệnh</th>
+                        <SortTh col="price" label="Giá" />
+                        <SortTh col="status" label="TT" />
+                        <th className="px-3 py-3 text-center text-xs font-bold text-gray-500 uppercase w-10">✕</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {pagedSims.map(sim => (
+                        <tr key={sim.id}
+                          className={`transition-colors ${selectedSims.has(sim.id) ? 'bg-blue-50/60' : 'hover:bg-red-50/20'}`}>
+                          <td className="px-3 py-2 w-9">
+                            <input type="checkbox" checked={selectedSims.has(sim.id)}
+                              onChange={() => setSelectedSims(prev => {
+                                const n = new Set(prev); n.has(sim.id) ? n.delete(sim.id) : n.add(sim.id); return n;
+                              })}
+                              className="rounded border-gray-300 accent-[#ee0033] cursor-pointer" />
+                          </td>
+                          <td className="px-3 py-2 sim-number font-black text-[#ee0033] whitespace-nowrap">
+                            {formatPhoneDisplay(sim.normalizedPhone)}
+                          </td>
+                          <td className="px-3 py-2 hidden lg:table-cell max-w-[140px]">
+                            <div className="truncate text-xs text-gray-400">{sim.primaryType || sim.simTypes[0]}</div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-full ${
+                              sim.network === '09' ? 'bg-purple-100 text-purple-700' :
+                              sim.network === '08' ? 'bg-pink-100 text-pink-700' : 'bg-blue-100 text-blue-700'
+                            }`}>
+                              {sim.network === '09' ? 'VT' : sim.network === '08' ? 'VNA' : 'MB'}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 hidden md:table-cell">
+                            <span className="text-xs font-bold" style={{ color: sim.menhColor }}>{sim.menh || '—'}</span>
+                          </td>
+                          <td className="px-3 py-2">
+                            {editPriceId === sim.id ? (
+                              <div className="flex items-center gap-1">
+                                <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)}
+                                  className="border rounded px-1.5 py-0.5 text-xs w-20 focus:outline-none focus:border-[#ee0033]" autoFocus />
+                                <button onClick={() => saveSimPrice(sim)} className="text-green-500"><Save size={13} /></button>
+                                <button onClick={() => setEditPriceId(null)} className="text-gray-400"><X size={13} /></button>
+                              </div>
+                            ) : (
+                              <button onClick={() => { setEditPriceId(sim.id); setEditPrice(sim.price?.replace(/[^0-9]/g, '') || ''); }}
+                                className="flex items-center gap-1 text-gray-700 hover:text-[#ee0033] font-bold text-xs group">
+                                {sim.price || '—'} <Edit2 size={10} className="opacity-0 group-hover:opacity-60" />
+                              </button>
+                            )}
+                          </td>
+                          <td className="px-3 py-2">
+                            <select value={sim.status || 'available'} onChange={e => handleStatusChange(sim, e.target.value as any)}
+                              className="border border-gray-100 rounded px-1 py-0.5 text-xs focus:outline-none focus:border-[#ee0033] bg-white cursor-pointer">
+                              <option value="available">🟢</option>
+                              <option value="reserved">🟡</option>
+                              <option value="sold">⚫</option>
+                            </select>
+                          </td>
+                          <td className="px-3 py-2 text-center">
+                            <button onClick={() => handleDeleteSim(sim.id)} className="text-gray-200 hover:text-red-500 transition-colors">
+                              <Trash2 size={13} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                      {filteredSims.length === 0 && (
+                        <tr><td colSpan={8} className="text-center py-16 text-gray-400">
+                          {sims.length === 0 ? (
+                            <div><div className="text-5xl mb-3">📂</div>
+                              <div className="font-semibold text-gray-500 mb-1">Kho chưa có SIM</div>
+                              <div className="text-xs">Nhấn <strong>Import Excel</strong> để thêm SIM</div>
+                            </div>
+                          ) : (
+                            <div><div className="text-3xl mb-2">🔍</div>
+                              <div className="text-sm">Không có SIM phù hợp với bộ lọc</div>
+                            </div>
+                          )}
+                        </td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pagination */}
+                {totalPages > 1 && (
+                  <div className="px-4 py-3 bg-gray-50 border-t border-gray-100 flex flex-wrap items-center gap-2 justify-between">
+                    <span className="text-xs text-gray-400">Trang {simPage}/{totalPages} · {filteredSims.length} kết quả</span>
+                    <div className="flex gap-1">
+                      <button onClick={() => setSimPage(p => Math.max(1, p - 1))} disabled={simPage === 1}
+                        className="px-2.5 py-1 text-xs border border-gray-200 rounded-lg disabled:opacity-40 hover:border-[#ee0033] hover:text-[#ee0033]">← Trước</button>
+                      {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                        const p = Math.max(1, Math.min(totalPages - 4, simPage - 2)) + i;
+                        return (
+                          <button key={p} onClick={() => setSimPage(p)}
+                            className={`w-7 h-7 text-xs rounded-lg font-semibold ${p === simPage ? 'bg-[#ee0033] text-white' : 'border border-gray-200 hover:border-[#ee0033] hover:text-[#ee0033]'}`}>
+                            {p}
                           </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                  {priceConfig.length === 0 && (
-                    <tr><td colSpan={4} className="text-center py-10 text-gray-400">Chưa có dữ liệu. Chạy migration SQL trước.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* ── KHUYẾN MÃI ── */}
-        {tab === 'promotions' && (
-          <div>
-            <h1 className="text-2xl font-black text-gray-800 mb-6">Khuyến mãi</h1>
-            <div className="bg-white rounded-2xl p-5 shadow-sm mb-6">
-              <h2 className="font-bold text-gray-700 mb-4">Thêm chương trình mới</h2>
-              <div className="space-y-3">
-                <input type="text" value={promoTitle} onChange={e => setPromoTitle(e.target.value)}
-                  placeholder="Tiêu đề khuyến mãi"
-                  className="w-full border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:border-[#ee0033]" />
-                <textarea value={promoDesc} onChange={e => setPromoDesc(e.target.value)}
-                  placeholder="Mô tả chi tiết" rows={3}
-                  className="w-full border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:border-[#ee0033] resize-none" />
-                <button onClick={addPromotion} className="bg-[#ee0033] text-white px-6 py-2.5 rounded-xl font-semibold hover:bg-[#cc0029] transition-colors">
-                  Thêm khuyến mãi
-                </button>
-              </div>
-            </div>
-            <div className="space-y-3">
-              {promotions.map(promo => (
-                <div key={promo.id} className="bg-white rounded-2xl p-4 shadow-sm flex items-start justify-between gap-4">
-                  <div>
-                    <div className="font-bold text-gray-800">{promo.title}</div>
-                    <div className="text-gray-500 text-sm mt-1">{promo.description}</div>
-                    <div className={`text-xs mt-2 ${promo.is_active ? 'text-green-600' : 'text-gray-400'}`}>
-                      {promo.is_active ? '● Đang hiển thị' : '○ Đã ẩn'}
+                        );
+                      })}
+                      <button onClick={() => setSimPage(p => Math.min(totalPages, p + 1))} disabled={simPage === totalPages}
+                        className="px-2.5 py-1 text-xs border border-gray-200 rounded-lg disabled:opacity-40 hover:border-[#ee0033] hover:text-[#ee0033]">Sau →</button>
                     </div>
                   </div>
-                  <button onClick={() => deletePromotion(promo.id)} className="text-gray-400 hover:text-red-500 transition-colors shrink-0">
-                    <Trash2 size={18} />
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── ĐƠN HÀNG ── */}
+          {tab === 'orders' && (
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <h1 className="text-xl font-black text-gray-800">Đơn hàng <span className="text-gray-400 font-normal text-sm">({orders.length})</span></h1>
+                <button onClick={loadData} className="ml-auto p-2 text-gray-400 hover:text-gray-700"><RefreshCw size={15} /></button>
+              </div>
+              <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm min-w-[500px]">
+                    <thead className="bg-gray-50 border-b border-gray-200 text-gray-500 text-xs uppercase">
+                      <tr>
+                        <th className="px-4 py-3 text-left">Số SIM</th>
+                        <th className="px-4 py-3 text-left">Khách hàng</th>
+                        <th className="px-4 py-3 text-left hidden sm:table-cell">SĐT liên hệ</th>
+                        <th className="px-4 py-3 text-left hidden md:table-cell">Giá</th>
+                        <th className="px-4 py-3 text-left">Trạng thái</th>
+                        <th className="px-4 py-3 text-center">Cập nhật</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {orders.map(order => (
+                        <tr key={order.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-3 sim-number font-bold text-[#ee0033] whitespace-nowrap text-sm">{order.sim_number}</td>
+                          <td className="px-4 py-3 font-semibold text-sm max-w-[120px]">
+                            <div className="truncate">{order.customer_name}</div>
+                          </td>
+                          <td className="px-4 py-3 text-gray-500 text-xs hidden sm:table-cell">{order.contact_phone}</td>
+                          <td className="px-4 py-3 font-bold text-[#ee0033] text-xs hidden md:table-cell">{order.sim_price}</td>
+                          <td className="px-4 py-3">
+                            <span className={`px-2 py-1 rounded-full text-xs font-semibold whitespace-nowrap ${ORDER_STATUS_COLORS[order.status]}`}>
+                              {ORDER_STATUS_LABELS[order.status]}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-center">
+                            <select value={order.status} onChange={e => updateOrderStatus(order.id, e.target.value as OrderStatus)}
+                              className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-[#ee0033] bg-white">
+                              {Object.entries(ORDER_STATUS_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                      {orders.length === 0 && (
+                        <tr><td colSpan={6} className="text-center py-14 text-gray-400">
+                          <div className="text-4xl mb-2">📋</div>
+                          <div className="text-sm">Chưa có đơn hàng nào</div>
+                        </td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── BẢNG GIÁ ── */}
+          {tab === 'price_config' && (
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <div>
+                  <h1 className="text-xl font-black text-gray-800">Bảng giá theo loại SIM</h1>
+                  <p className="text-gray-400 text-xs mt-0.5">Sửa giá → tự động áp dụng cho lần import tiếp theo</p>
+                </div>
+                <button onClick={() => fetchPriceConfig().then(setPriceConfig)}
+                  className="ml-auto p-2 text-gray-400 hover:text-gray-700"><RefreshCw size={15} /></button>
+              </div>
+              <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm min-w-[400px]">
+                    <thead className="bg-gray-50 border-b border-gray-200 text-gray-500 text-xs uppercase">
+                      <tr>
+                        <th className="px-4 py-3 text-left">Loại SIM</th>
+                        <th className="px-4 py-3 text-right">Mạng 03</th>
+                        <th className="px-4 py-3 text-right">Mạng 09/08</th>
+                        <th className="px-4 py-3 text-center w-14">Sửa</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {priceConfig.map(pc => (
+                        <tr key={pc.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-2.5 font-semibold text-gray-800 text-sm">{pc.sim_type}</td>
+                          <td className="px-4 py-2.5 text-right">
+                            {editPriceConfigId === pc.id
+                              ? <input type="number" value={editPrice03} onChange={e => setEditPrice03(e.target.value)}
+                                  className="border rounded px-2 py-0.5 text-xs w-24 text-right focus:outline-none focus:border-[#ee0033]" autoFocus />
+                              : <span className="text-xs text-gray-700">{pc.price_03.toLocaleString('vi-VN')}đ</span>}
+                          </td>
+                          <td className="px-4 py-2.5 text-right">
+                            {editPriceConfigId === pc.id
+                              ? <input type="number" value={editPrice09} onChange={e => setEditPrice09(e.target.value)}
+                                  className="border rounded px-2 py-0.5 text-xs w-24 text-right focus:outline-none focus:border-[#ee0033]" />
+                              : <span className="text-xs text-gray-700">{pc.price_09.toLocaleString('vi-VN')}đ</span>}
+                          </td>
+                          <td className="px-4 py-2.5 text-center">
+                            {editPriceConfigId === pc.id ? (
+                              <div className="flex justify-center gap-2">
+                                <button onClick={() => savePriceConfig(pc.id)} className="text-green-500 hover:text-green-700"><Save size={14} /></button>
+                                <button onClick={() => setEditPriceConfigId(null)} className="text-gray-400"><X size={14} /></button>
+                              </div>
+                            ) : (
+                              <button onClick={() => { setEditPriceConfigId(pc.id); setEditPrice03(String(pc.price_03)); setEditPrice09(String(pc.price_09)); }}
+                                className="text-gray-400 hover:text-[#ee0033]"><Edit2 size={14} /></button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                      {priceConfig.length === 0 && (
+                        <tr><td colSpan={4} className="text-center py-10 text-gray-400 text-sm">Chưa có dữ liệu. Chạy migration SQL trước.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── KHUYẾN MÃI ── */}
+          {tab === 'promotions' && (
+            <div>
+              <h1 className="text-xl font-black text-gray-800 mb-4">Khuyến mãi</h1>
+              <div className="bg-white rounded-2xl p-4 shadow-sm mb-4">
+                <h2 className="font-bold text-gray-700 mb-3 text-sm">Thêm chương trình mới</h2>
+                <div className="space-y-3">
+                  <input type="text" value={promoTitle} onChange={e => setPromoTitle(e.target.value)}
+                    placeholder="Tiêu đề khuyến mãi"
+                    className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#ee0033]" />
+                  <textarea value={promoDesc} onChange={e => setPromoDesc(e.target.value)}
+                    placeholder="Mô tả chi tiết" rows={3}
+                    className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#ee0033] resize-none" />
+                  <button onClick={addPromotion}
+                    className="bg-[#ee0033] text-white px-6 py-2.5 rounded-xl font-semibold hover:bg-[#cc0029] transition-colors text-sm">
+                    Thêm khuyến mãi
                   </button>
                 </div>
-              ))}
-              {promotions.length === 0 && <p className="text-gray-400 text-sm text-center py-8">Chưa có chương trình khuyến mãi</p>}
+              </div>
+              <div className="space-y-3">
+                {promotions.map(promo => (
+                  <div key={promo.id} className="bg-white rounded-2xl p-4 shadow-sm flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="font-bold text-gray-800 text-sm">{promo.title}</div>
+                      <div className="text-gray-500 text-xs mt-1">{promo.description}</div>
+                      <div className={`text-xs mt-2 ${promo.is_active ? 'text-green-600' : 'text-gray-400'}`}>
+                        {promo.is_active ? '● Đang hiển thị' : '○ Đã ẩn'}
+                      </div>
+                    </div>
+                    <button onClick={() => deletePromotion(promo.id)} className="text-gray-300 hover:text-red-500 transition-colors shrink-0">
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+                {promotions.length === 0 && (
+                  <p className="text-gray-400 text-sm text-center py-8">Chưa có chương trình khuyến mãi</p>
+                )}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
+        </div>
       </div>
     </div>
   );
