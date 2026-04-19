@@ -60,30 +60,31 @@ const findPhoneCol = (rows: any[][]): { headerRow: number; phoneCol: number } =>
 
 // ─── Visual helpers ──────────────────────────────────────────────────────────
 
-const getTypeColor = (type?: string): { bg: string; color: string } => {
-  if (!type || type === 'Khác') return { bg: '#f3f4f6', color: '#9ca3af' };
+const getTypeBg = (type?: string): string => {
+  if (!type || type === 'Khác') return '#e5e7eb';
   const t = type.toLowerCase();
-  if (t.includes('ngũ quý')) return { bg: '#ede9fe', color: '#6d28d9' };
-  if (t.includes('tứ quý')) return { bg: '#fee2e2', color: '#b91c1c' };
-  if (t.includes('tam hoa')) return { bg: '#fef3c7', color: '#b45309' };
-  if (t.includes('rồng') || t.includes('tiến 7')) return { bg: '#fce7f3', color: '#9d174d' };
-  if (t.includes('sảnh') || t.includes('tiến 6') || t.includes('tiến 5')) return { bg: '#dbeafe', color: '#1d4ed8' };
-  if (t.includes('gánh')) return { bg: '#e0e7ff', color: '#3730a3' };
-  if (t.includes('taxi')) return { bg: '#fef9c3', color: '#a16207' };
-  if (t.includes('tăng dần')) return { bg: '#d1fae5', color: '#065f46' };
-  if (t.includes('đầu số đẹp')) return { bg: '#fce7f3', color: '#be185d' };
-  if (t.includes('tiến')) return { bg: '#e0f2fe', color: '#0369a1' };
-  if (t.includes('abab') || t.includes('aabb')) return { bg: '#f0fdf4', color: '#166534' };
-  if (t.includes('aab') || t.includes('aba') || t.includes('kép')) return { bg: '#f0fdf4', color: '#15803d' };
-  return { bg: '#f3f4f6', color: '#6b7280' };
+  if (t.includes('ngũ quý') || t.includes('tứ quý')) return '#7c3aed';
+  if (t.includes('tam hoa')) return '#d97706';
+  if (t.includes('rồng') || t.includes('tiến 7')) return '#be185d';
+  if (t.includes('sảnh') || t.includes('tiến 6') || t.includes('tiến 5') || t.includes('tiến 4')) return '#ee0033';
+  if (t.includes('gánh đẹp')) return '#ee0033';
+  if (t.includes('gánh')) return '#374151';
+  if (t.includes('taxi')) return '#b45309';
+  if (t.includes('tăng dần')) return '#059669';
+  if (t.includes('đầu số đẹp')) return '#9d174d';
+  if (t.includes('tiến')) return '#2563eb';
+  if (t.includes('09 trùng') || t.includes('trùng')) return '#6b7280';
+  return '#374151';
 };
 
 const TypeBadge = ({ type }: { type?: string }) => {
-  if (!type || type === 'Khác') return <span className="text-[10px] text-gray-300 italic">Khác</span>;
-  const { bg, color } = getTypeColor(type);
+  if (!type || type === 'Khác')
+    return <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded-full uppercase" style={{ background: '#e5e7eb', color: '#9ca3af' }}>KHÁC</span>;
+  const bg = getTypeBg(type);
+  const isLight = bg === '#e5e7eb';
   return (
-    <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded-full whitespace-nowrap"
-      style={{ backgroundColor: bg, color }}>
+    <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded-full uppercase whitespace-nowrap"
+      style={{ background: bg, color: isLight ? '#6b7280' : 'white' }}>
       {type}
     </span>
   );
@@ -124,6 +125,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
   const [simSearch, setSimSearch] = useState('');
   const [networkFilter, setNetworkFilter] = useState<'all' | '03' | '09' | '08'>('all');
   const [menhFilter, setMenhFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
   // Sort
   const [sortCol, setSortCol] = useState<SortCol>('phone');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
@@ -302,6 +304,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       if (simFilter !== 'all' && s.status !== simFilter) return false;
       if (networkFilter !== 'all' && s.network !== networkFilter) return false;
       if (menhFilter && s.menh !== menhFilter) return false;
+      if (typeFilter && !s.simTypes?.includes(typeFilter as any)) return false;
       if (simSearch) {
         const q = simSearch.replace(/[^0-9]/g, '');
         if (q && !s.normalizedPhone.includes(q)) return false;
@@ -320,7 +323,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       else if (sortCol === 'network') cmp = (a.network || '').localeCompare(b.network || '');
       return sortDir === 'asc' ? cmp : -cmp;
     });
-  }, [sims, simFilter, networkFilter, menhFilter, simSearch, sortCol, sortDir]);
+  }, [sims, simFilter, networkFilter, menhFilter, typeFilter, simSearch, sortCol, sortDir]);
 
   const totalPages = Math.ceil(filteredSims.length / SIM_PAGE_SIZE);
   const pagedSims = filteredSims.slice((simPage - 1) * SIM_PAGE_SIZE, simPage * SIM_PAGE_SIZE);
@@ -458,75 +461,110 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
             <div className="flex flex-1 overflow-hidden h-full">
 
               {/* LEFT PANEL */}
-              <div className="hidden lg:flex flex-col w-56 shrink-0 bg-white border-r border-gray-200 overflow-y-auto">
+              <div className="hidden lg:flex flex-col w-64 shrink-0 bg-white border-r border-gray-200 overflow-y-auto">
+
                 {/* Import button */}
                 <div className="p-3 border-b border-gray-100">
-                  <label className={`flex items-center justify-center gap-2 w-full py-2.5 rounded-xl text-sm font-bold cursor-pointer transition-colors ${loading ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-[#ee0033] hover:bg-[#cc0029] text-white'}`}>
+                  <label className={`flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-sm font-bold cursor-pointer transition-colors border-2 ${loading ? 'border-gray-200 bg-gray-50 text-gray-400 cursor-not-allowed' : 'border-gray-300 bg-white text-gray-700 hover:border-[#ee0033] hover:text-[#ee0033]'}`}>
                     <Upload size={14} />
                     {loading ? 'Đang xử lý...' : 'Nhập File Excel SIM'}
                     <input type="file" accept=".xlsx,.xls,.csv" onChange={handleExcel} className="hidden" disabled={loading} />
                   </label>
                 </div>
 
-                {/* Tất cả SIM */}
+                {/* Paste textarea */}
                 <div className="p-3 border-b border-gray-100">
-                  <button onClick={() => { setSimFilter('all'); setMenhFilter(''); setNetworkFilter('all'); setSimSearch(''); setSimPage(1); }}
-                    className={`flex items-center justify-between w-full px-3 py-2.5 rounded-xl font-bold transition-colors text-sm
-                      ${simFilter === 'all' && !menhFilter && networkFilter === 'all' && !simSearch ? 'bg-[#ee0033] text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
-                    <span className="flex items-center gap-2">≡ Tất cả SIM</span>
-                    <span className="font-black">{sims.length.toLocaleString('vi-VN')}</span>
+                  <div className="text-[10px] font-bold text-gray-400 mb-2 uppercase tracking-wider">Dán danh sách số (Paste)</div>
+                  <textarea placeholder="Dán các số SIM vào đây... (cách nhau bởi dấu phẩy hoặc xuống dòng)"
+                    className="w-full border border-gray-200 rounded-lg p-2 text-xs resize-none h-16 focus:outline-none focus:border-[#ee0033] text-gray-600" />
+                  <button className="mt-2 w-full py-1.5 border border-gray-200 text-gray-500 rounded-lg text-xs font-bold hover:bg-gray-50 transition-colors">
+                    + THÊM VÀO DANH SÁCH
                   </button>
                 </div>
 
-                {/* Trạng thái */}
+                {/* Tất cả SIM */}
                 <div className="p-3 border-b border-gray-100">
-                  <div className="text-[10px] font-bold text-gray-400 mb-2 uppercase tracking-wider">Trạng thái</div>
-                  {([
-                    ['available', '🟢', 'Đang bán'] as const,
-                    ['sold', '⚫', 'Đã bán'] as const,
-                    ['reserved', '🟡', 'Đang giữ'] as const,
-                  ]).map(([f, icon, label]) => (
-                    <button key={f} onClick={() => { setSimFilter(f); setSimPage(1); }}
-                      className={`flex items-center justify-between w-full px-2.5 py-1.5 rounded-lg text-xs font-semibold mb-1 transition-colors
-                        ${simFilter === f ? 'bg-red-50 text-[#ee0033]' : 'text-gray-600 hover:bg-gray-50'}`}>
-                      <span>{icon} {label}</span>
-                      <span className="text-gray-400">{sims.filter(s => s.status === f).length.toLocaleString()}</span>
-                    </button>
-                  ))}
+                  <button onClick={() => { setSimFilter('all'); setMenhFilter(''); setNetworkFilter('all'); setSimSearch(''); setTypeFilter(''); setSimPage(1); }}
+                    className={`flex items-center justify-between w-full px-4 py-2.5 rounded-lg font-bold transition-colors text-sm
+                      ${simFilter === 'all' && !menhFilter && !typeFilter && networkFilter === 'all' && !simSearch ? 'bg-[#ee0033] text-white' : 'bg-[#ee0033] text-white opacity-90 hover:opacity-100'}`}>
+                    <span className="flex items-center gap-2">≡ Tất cả SIM</span>
+                    <span className="font-black bg-white/20 px-2 py-0.5 rounded-full text-sm">{sims.length.toLocaleString('vi-VN')}</span>
+                  </button>
                 </div>
 
-                {/* Mạng */}
+                {/* Phân loại VIP (Sảnh) */}
                 <div className="p-3 border-b border-gray-100">
-                  <div className="text-[10px] font-bold text-gray-400 mb-2 uppercase tracking-wider">Nhà mạng</div>
+                  <div className="text-[10px] font-bold text-gray-500 mb-2 uppercase tracking-wider">Phân loại VIP (Sảnh)</div>
                   {([
-                    ['09', 'VT', 'Viettel/MB', 'bg-purple-100 text-purple-700'],
-                    ['03', 'MB', 'Mobi/Vina', 'bg-blue-100 text-blue-700'],
-                    ['08', 'VNA', 'Vinaphone 08x', 'bg-pink-100 text-pink-700'],
-                  ] as [string, string, string, string][]).map(([v, short, label, cls]) => (
-                    <button key={v} onClick={() => { setNetworkFilter(v as any); setSimPage(1); }}
-                      className={`flex items-center justify-between w-full px-2.5 py-1.5 rounded-lg text-xs font-semibold mb-1 transition-colors
-                        ${networkFilter === v ? 'bg-red-50 text-[#ee0033]' : 'text-gray-600 hover:bg-gray-50'}`}>
-                      <span className="flex items-center gap-1.5">
-                        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-full ${cls}`}>{short}</span>
-                        {label}
-                      </span>
-                      <span className="text-gray-400">{sims.filter(s => s.network === v).length.toLocaleString()}</span>
-                    </button>
-                  ))}
+                    'Tiến 7 số (Rồng)',
+                    'Tiến 6 số (Sảnh)',
+                    'Tiến 5 số (Sảnh)',
+                    'Tiến 4 số (Sảnh)',
+                  ]).map(typeName => {
+                    const count = sims.filter(s => s.simTypes?.includes(typeName as any) && s.status === 'available').length;
+                    const pc = priceConfig.find(p => p.sim_type === typeName);
+                    const active = typeFilter === typeName;
+                    return (
+                      <button key={typeName} onClick={() => { setTypeFilter(active ? '' : typeName); setSimPage(1); }}
+                        className={`w-full mb-2 last:mb-0 rounded-lg p-2 text-left transition-colors ${active ? 'bg-red-50 border border-red-200' : 'hover:bg-gray-50 border border-transparent'}`}>
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-yellow-500 text-sm">👑</span>
+                          <span className="text-xs font-bold text-gray-700 flex-1 truncate">{typeName}</span>
+                          <span className={`text-xs font-black ${active ? 'text-[#ee0033]' : 'text-gray-500'}`}>{count}</span>
+                        </div>
+                        {pc && (
+                          <div className="pl-5 grid grid-cols-2 gap-x-1 text-[10px]">
+                            <span className="text-blue-600 font-bold">03</span>
+                            <span className="text-gray-600 font-semibold text-right">{pc.price_03.toLocaleString()}</span>
+                            <span className="text-purple-600 font-bold">09/08</span>
+                            <span className="text-gray-600 font-semibold text-right">{pc.price_09.toLocaleString()}</span>
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
 
-                {/* Mệnh */}
+                {/* Đầu số Taxi */}
+                <div className="p-3 border-b border-gray-100">
+                  <div className="text-[10px] font-bold text-gray-500 mb-2 uppercase tracking-wider">Đầu số Taxi</div>
+                  {(['Taxi Đầu (ABC.ABC)']).map(typeName => {
+                    const count = sims.filter(s => s.simTypes?.includes(typeName as any) && s.status === 'available').length;
+                    const pc = priceConfig.find(p => p.sim_type === typeName);
+                    const active = typeFilter === typeName;
+                    return (
+                      <button key={typeName} onClick={() => { setTypeFilter(active ? '' : typeName); setSimPage(1); }}
+                        className={`w-full rounded-lg p-2 text-left transition-colors ${active ? 'bg-red-50 border border-red-200' : 'hover:bg-gray-50 border border-transparent'}`}>
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-sm">🚕</span>
+                          <span className="text-xs font-bold text-gray-700 flex-1 truncate">{typeName}</span>
+                          <span className={`text-xs font-black ${active ? 'text-[#ee0033]' : 'text-gray-500'}`}>{count}</span>
+                        </div>
+                        {pc && (
+                          <div className="pl-5 grid grid-cols-2 gap-x-1 text-[10px]">
+                            <span className="text-blue-600 font-bold">03</span>
+                            <span className="text-gray-600 font-semibold text-right">{pc.price_03.toLocaleString()}</span>
+                            <span className="text-purple-600 font-bold">09/08</span>
+                            <span className="text-gray-600 font-semibold text-right">{pc.price_09.toLocaleString()}</span>
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Phong thủy Mệnh */}
                 <div className="p-3 flex-1 border-b border-gray-100">
-                  <div className="text-[10px] font-bold text-gray-400 mb-2 uppercase tracking-wider">Phong thủy</div>
-                  {([['Kim','#b5a642'],['Mộc','#4caf50'],['Thủy','#2196f3'],['Hỏa','#f44336'],['Thổ','#ff9800']] as [string,string][]).map(([m, c]) => (
+                  <div className="text-[10px] font-bold text-gray-500 mb-2 uppercase tracking-wider">Phong thủy</div>
+                  {([['Kim','#ca8a04'],['Mộc','#16a34a'],['Thủy','#2563eb'],['Hỏa','#dc2626'],['Thổ','#92400e']] as [string,string][]).map(([m, c]) => (
                     <button key={m} onClick={() => { setMenhFilter(menhFilter === m ? '' : m); setSimPage(1); }}
                       className={`flex items-center justify-between w-full px-2.5 py-1.5 rounded-lg text-xs font-semibold mb-1 transition-colors
                         ${menhFilter === m ? 'bg-gray-100' : 'text-gray-600 hover:bg-gray-50'}`}>
                       <span className="flex items-center gap-1.5">
-                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: c }} />
-                        <span style={{ color: menhFilter === m ? c : undefined }}>{m}</span>
+                        <span className="w-3 h-3 rounded-sm shrink-0" style={{ background: c }} />
+                        <span style={{ color: menhFilter === m ? c : undefined }} className="font-bold">{m}</span>
                       </span>
-                      <span className="text-gray-400">{sims.filter(s => s.menh === m).length.toLocaleString()}</span>
+                      <span className="text-gray-400 text-[10px]">{sims.filter(s => s.menh === m).length.toLocaleString()}</span>
                     </button>
                   ))}
                 </div>
@@ -534,7 +572,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
                 {/* Delete all */}
                 <div className="p-3">
                   <button onClick={deleteAll}
-                    className="w-full flex items-center justify-center gap-1.5 py-2 border border-red-200 text-red-400 hover:bg-red-50 rounded-xl text-xs font-semibold transition-colors">
+                    className="w-full flex items-center justify-center gap-1.5 py-2 border border-red-200 text-red-400 hover:bg-red-50 rounded-lg text-xs font-semibold transition-colors">
                     <Trash2 size={12} /> Xoá tất cả kho
                   </button>
                 </div>
@@ -556,30 +594,32 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
                     <option value="sold">⚫ Đã bán</option>
                     <option value="reserved">🟡 Đang giữ</option>
                   </select>
-                  <select value={menhFilter} onChange={e => { setMenhFilter(e.target.value); setSimPage(1); }}
-                    className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none bg-white">
-                    <option value="">Mệnh</option>
-                    {['Kim','Mộc','Thủy','Hỏa','Thổ'].map(m => <option key={m}>{m}</option>)}
-                  </select>
                 </div>
 
                 {/* Top bar */}
                 <div className="bg-white border-b border-gray-200 px-4 py-2.5 flex items-center gap-2 flex-wrap shrink-0">
-                  <span className="text-sm font-bold text-gray-700">
-                    Đang xem: <span className="text-[#ee0033]">
-                      {({ all: 'Tất cả', available: 'Đang bán', sold: 'Đã bán', reserved: 'Đang giữ' } as Record<string,string>)[simFilter]}
+                  <span className="text-sm font-bold text-gray-800">
+                    Đang xem: <span className="text-[#ee0033] font-black">
+                      {typeFilter || ({ all: 'Tất cả', available: 'Đang bán', sold: 'Đã bán', reserved: 'Đang giữ' } as Record<string,string>)[simFilter]}
                     </span>
-                    {menhFilter && <span className="text-gray-400 font-normal text-xs"> · {menhFilter}</span>}
                   </span>
-                  <span className="text-xs text-gray-400">{filteredSims.length.toLocaleString()} / {sims.length.toLocaleString()}</span>
+                  <span className="text-xs text-gray-400 font-semibold">
+                    {filteredSims.length.toLocaleString()} / {sims.length.toLocaleString()}
+                  </span>
                   <div className="flex-1" />
-                  <input type="tel" placeholder="🔍 Tìm số SIM..." value={simSearch}
-                    onChange={e => { setSimSearch(e.target.value); setSimPage(1); }}
-                    className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-[#ee0033] w-36" />
-                  {(simFilter !== 'all' || menhFilter || networkFilter !== 'all' || simSearch) && (
-                    <button onClick={() => { setSimFilter('all'); setMenhFilter(''); setNetworkFilter('all'); setSimSearch(''); setSimPage(1); }}
-                      className="px-3 py-1.5 border border-gray-200 text-gray-500 hover:bg-gray-50 rounded-lg text-xs font-semibold">
-                      Xóa bộ lọc
+                  <div className="flex items-center border border-gray-200 rounded-lg overflow-hidden">
+                    <span className="px-2.5 text-gray-400"><svg width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></span>
+                    <input type="tel" placeholder="Tìm số SIM..." value={simSearch}
+                      onChange={e => { setSimSearch(e.target.value); setSimPage(1); }}
+                      className="py-1.5 pr-3 text-xs focus:outline-none w-32 bg-white" />
+                  </div>
+                  <button className="p-1.5 bg-[#ee0033] text-white rounded-lg hover:bg-[#cc0029] transition-colors" title="Lọc nâng cao">
+                    <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path d="M4.5 6.375a4.125 4.125 0 1 1 8.25 0 4.125 4.125 0 0 1-8.25 0ZM14.25 8.625a3.375 3.375 0 1 1 6.75 0 3.375 3.375 0 0 1-6.75 0ZM1.5 19.125a7.125 7.125 0 0 1 14.25 0v.003l-.001.119a.75.75 0 0 1-.363.63 13.067 13.067 0 0 1-6.761 1.873c-2.472 0-4.786-.684-6.76-1.873a.75.75 0 0 1-.364-.63l-.001-.122ZM17.25 19.128l-.001.144a2.25 2.25 0 0 1-.233.96 10.088 10.088 0 0 0 5.06-1.01.75.75 0 0 0 .42-.643 4.875 4.875 0 0 0-6.957-4.611 8.586 8.586 0 0 1 1.71 5.157v.003Z"/></svg>
+                  </button>
+                  {(simFilter !== 'all' || menhFilter || networkFilter !== 'all' || simSearch || typeFilter) && (
+                    <button onClick={() => { setSimFilter('all'); setMenhFilter(''); setNetworkFilter('all'); setSimSearch(''); setTypeFilter(''); setSimPage(1); }}
+                      className="flex items-center gap-1 px-3 py-1.5 border border-red-200 text-red-500 hover:bg-red-50 rounded-lg text-xs font-bold transition-colors">
+                      <Trash2 size={11} /> Xóa List đang lọc
                     </button>
                   )}
                   {selectedSims.size > 0 && (
@@ -588,6 +628,10 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
                       <Trash2 size={12} /> Xoá {selectedSims.size}
                     </button>
                   )}
+                  <button className="px-3 py-1.5 border border-gray-200 text-gray-500 hover:bg-gray-50 rounded-lg text-xs font-semibold flex items-center gap-1">
+                    <svg width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065Z"/><circle cx="12" cy="12" r="3"/></svg>
+                    Cài đặt
+                  </button>
                   <button onClick={loadData} className="p-1.5 text-gray-400 hover:text-gray-700 shrink-0">
                     <RefreshCw size={14} />
                   </button>
