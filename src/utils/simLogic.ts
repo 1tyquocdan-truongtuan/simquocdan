@@ -4,11 +4,15 @@ export const normalizePhone = (phone: any): string => {
   if (phone === null || phone === undefined) return '';
   let str = phone.toString().replace(/[^0-9]/g, '');
   if (str.length < 9) return '';
+  // Strip Vietnam country code +84
+  if (str.startsWith('84') && str.length >= 11) str = '0' + str.substring(2);
+  // 9 digits: mobile without leading 0 (Excel strips it)
   if (str.length === 9) str = '0' + str;
-  if (str.length > 10) {
-    if (str.startsWith('84')) str = '0' + str.substring(2);
-  }
-  return str.slice(-10);
+  // 10 digits not starting with 0: landline/mobile without leading 0 (e.g. 2376502929 → 02376502929)
+  if (str.length === 10 && !str.startsWith('0')) str = '0' + str;
+  // Accept 10-digit mobile or 11-digit landline (both starting with 0)
+  if ((str.length === 10 || str.length === 11) && str.startsWith('0')) return str;
+  return '';
 };
 
 export const findConsecutiveIndex = (phone: string, n: number): number => {

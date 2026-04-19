@@ -69,18 +69,29 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
         return;
       }
 
-      // Strip Vietnamese diacritics để match "SĐT", "Số", "sđt"...
-      const stripDiacritics = (s: string) =>
-        s.normalize('NFD').replace(/[\u0300-\u036f\u0111]/g, d => d === '\u0111' ? 'd' : '');
+      // Chuẩn hóa header: bỏ dấu tiếng Việt, thường hóa, trim
+      const stripVI = (s: string) =>
+        s.toLowerCase().trim()
+          .replace(/[àáạảãăắặẳẵằâấậẩẫ]/g, 'a')
+          .replace(/[èéẹẻẽêếệểễề]/g, 'e')
+          .replace(/[ìíịỉĩ]/g, 'i')
+          .replace(/[òóọỏõôốộổỗồơớợởỡờ]/g, 'o')
+          .replace(/[ùúụủũưứựửữừ]/g, 'u')
+          .replace(/[ỳýỵỷỹ]/g, 'y')
+          .replace(/[đ]/g, 'd');
 
-      const headers = rows[0].map((h: any) => stripDiacritics(String(h).toLowerCase()));
+      const headers = rows[0].map((h: any) => stripVI(String(h)));
+      // Nhận diện cột SĐT: "SỐ ISDN", "SĐT", "Số điện thoại", "Phone", "SIM", "Tel", ...
       let phoneCol = headers.findIndex((h: string) =>
-        h.includes('so') || h.includes('phone') || h.includes('sim') || h.includes('sdt') || h.includes('tel') || h.includes('dt')
+        h.includes('isdn') || h.includes('sdt') || h.includes('so dt') ||
+        h.includes('dien thoai') || h.includes('phone') || h.includes('mobile') ||
+        h.includes('tel') || h.includes('sim') ||
+        (h.includes('so') && !h.includes('stt') && !h.includes('so luong') && !h.includes('so thu'))
       );
 
-      // Fallback: scan các dòng đầu để tìm cột chứa SĐT hợp lệ
+      // Fallback: scan tối đa 10 dòng đầu để tìm cột có số hợp lệ
       if (phoneCol < 0) {
-        outer: for (let r = 1; r <= Math.min(5, rows.length - 1); r++) {
+        outer: for (let r = 1; r <= Math.min(10, rows.length - 1); r++) {
           for (let c = 0; c < (rows[r] || []).length; c++) {
             if (normalizePhone(rows[r][c])) { phoneCol = c; break outer; }
           }
@@ -88,7 +99,7 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       }
 
       if (phoneCol < 0) {
-        alert('Không tìm thấy cột số điện thoại!\n\nFile cần có cột tiêu đề chứa "Số", "SĐT", "Phone", "SIM" hoặc cột chứa số 10 số (0xx.xxx.xxxx).');
+        alert('Không tìm thấy cột số điện thoại!\n\nFile cần có cột tiêu đề chứa "SỐ ISDN", "SĐT", "Phone", "SIM"\nhoặc cột chứa số điện thoại 9–11 chữ số.');
         return;
       }
 
@@ -125,8 +136,8 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
       }
 
       if (entries.length === 0) {
-        const colName = rows[0][phoneCol] ?? `Cột ${phoneCol + 1}`;
-        alert(`Không tìm thấy số điện thoại hợp lệ!\n\nĐã đọc cột "${colName}" nhưng không có số nào đúng định dạng 10 chữ số (bắt đầu bằng 03x, 07x, 08x, 09x).`);
+        const colName = rows[0]?.[phoneCol] ?? `Cột ${phoneCol + 1}`;
+        alert(`Không tìm thấy số điện thoại hợp lệ!\n\nĐã đọc cột "${colName}" nhưng không có số nào hợp lệ.\n\nĐịnh dạng được chấp nhận:\n• 9 số (không có số 0 đầu): 326225574\n• 10 số: 0326225574\n• 11 số (số bàn): 02376502929\n• 10 số (số bàn không số 0): 2376502929`);
         return;
       }
 
