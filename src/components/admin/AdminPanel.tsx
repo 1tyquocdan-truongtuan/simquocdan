@@ -33,15 +33,20 @@ const stripVI = (s: string) =>
     .replace(/[đ]/g, 'd');
 
 const findPhoneCol = (rows: any[][]): { headerRow: number; phoneCol: number } => {
-  // Ưu tiên: tìm hàng header chứa tên cột SĐT
   for (let r = 0; r < Math.min(15, rows.length); r++) {
-    const headers = (rows[r] || []).map((h: any) => stripVI(String(h ?? '')));
-    const col = headers.findIndex((h: string) =>
-      h.includes('isdn') || h.includes('sdt') || h.includes('so dt') ||
-      h.includes('dien thoai') || h.includes('phone') || h.includes('mobile') ||
-      h.includes('tel') || h === 'sim' ||
-      (h.includes('so') && !h.includes('stt') && !h.includes('so luong') && !h.includes('so thu') && !h.includes('iso'))
-    );
+    const row = rows[r] || [];
+    // Bỏ qua hàng tiêu đề/mô tả: cần ít nhất 2 ô có nội dung mới là header thật
+    const nonEmpty = row.filter((c: any) => c != null && String(c).trim() !== '').length;
+    if (nonEmpty < 2) continue;
+    const headers = row.map((h: any) => stripVI(String(h ?? '')));
+    const col = headers.findIndex((h: string) => {
+      // Keyword đặc thù — khớp bất kể độ dài
+      if (h.includes('isdn') || h === 'sdt' || h === 'phone' || h === 'mobile' || h === 'sim') return true;
+      // Keyword chung — chỉ khớp khi ô ngắn (không phải câu mô tả dài)
+      if (h.length > 25) return false;
+      return h.includes('dien thoai') || h.includes('so dt') || h.includes('sdt') ||
+        (h.includes('so') && !h.includes('stt') && !h.includes('so luong') && !h.includes('so thu') && !h.includes('iso'));
+    });
     if (col >= 0) return { headerRow: r, phoneCol: col };
   }
   // Fallback: scan data để tìm cột có giá trị SĐT hợp lệ
