@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { X, Lock, Eye, EyeOff } from 'lucide-react';
 
 const CREDENTIALS = {
-  admin: { password: 'admin@simquocdan', role: 'admin' as const },
+  admin: { password: '0', role: 'admin' as const },
   nhanvien: { password: 'nv@simquocdan', role: 'staff' as const },
 };
 
