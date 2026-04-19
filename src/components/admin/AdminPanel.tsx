@@ -59,33 +59,48 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
     setLoading(true);
     setImportResult(null);
     try {
-      // Parse Excel
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { type: 'array' });
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
-      if (rows.length < 2) return;
 
-      const headers = rows[0].map((h: any) => String(h).toLowerCase());
-      // Tìm cột phone qua header keyword trước
-      let phoneCol = headers.findIndex((h: string) => h.includes('số') || h.includes('phone') || h.includes('sim') || h.includes('sdt'));
-      // Nếu không tìm được qua header, scan dòng đầu tiên để tìm cột có số điện thoại hợp lệ
-      if (phoneCol < 0 && rows.length > 1) {
-        for (let c = 0; c < rows[1].length; c++) {
-          if (normalizePhone(rows[1][c])) { phoneCol = c; break; }
+      if (rows.length < 2) {
+        alert('File Excel trống hoặc không có dữ liệu!');
+        return;
+      }
+
+      // Strip Vietnamese diacritics để match "SĐT", "Số", "sđt"...
+      const stripDiacritics = (s: string) =>
+        s.normalize('NFD').replace(/[\u0300-\u036f\u0111]/g, d => d === '\u0111' ? 'd' : '');
+
+      const headers = rows[0].map((h: any) => stripDiacritics(String(h).toLowerCase()));
+      let phoneCol = headers.findIndex((h: string) =>
+        h.includes('so') || h.includes('phone') || h.includes('sim') || h.includes('sdt') || h.includes('tel') || h.includes('dt')
+      );
+
+      // Fallback: scan các dòng đầu để tìm cột chứa SĐT hợp lệ
+      if (phoneCol < 0) {
+        outer: for (let r = 1; r <= Math.min(5, rows.length - 1); r++) {
+          for (let c = 0; c < (rows[r] || []).length; c++) {
+            if (normalizePhone(rows[r][c])) { phoneCol = c; break outer; }
+          }
         }
       }
-      const batchName = file.name.replace(/\.[^.]+$/, '');
 
-      // Cần bảng giá để auto-price
+      if (phoneCol < 0) {
+        alert('Không tìm thấy cột số điện thoại!\n\nFile cần có cột tiêu đề chứa "Số", "SĐT", "Phone", "SIM" hoặc cột chứa số 10 số (0xx.xxx.xxxx).');
+        return;
+      }
+
+      const batchName = file.name.replace(/\.[^.]+$/, '');
       const config = priceConfig.length > 0 ? priceConfig : await fetchPriceConfig();
       if (config.length > 0 && priceConfig.length === 0) setPriceConfig(config);
 
       const entries: Parameters<typeof upsertSims>[0] = [];
-
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
-        const raw = row[phoneCol >= 0 ? phoneCol : 0];
+        if (!row || row.every((c: any) => c == null || c === '')) continue;
+        const raw = row[phoneCol];
         const phone = normalizePhone(raw);
         if (!phone) continue;
 
@@ -100,8 +115,8 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
           original_phone: String(raw),
           network,
           price,
-          sim_types: types,
-          primary_type: primaryType,
+          sim_types: types as string[],
+          primary_type: primaryType as string,
           menh,
           menh_color: color,
           unit_advance_detail: detail || '',
@@ -109,8 +124,21 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
         });
       }
 
-      const result = await upsertSims(entries);
-      setImportResult({ ...result, total: entries.length });
+      if (entries.length === 0) {
+        const colName = rows[0][phoneCol] ?? `Cột ${phoneCol + 1}`;
+        alert(`Không tìm thấy số điện thoại hợp lệ!\n\nĐã đọc cột "${colName}" nhưng không có số nào đúng định dạng 10 chữ số (bắt đầu bằng 03x, 07x, 08x, 09x).`);
+        return;
+      }
+
+      // Upload theo từng lô 100 để tránh timeout
+      let totalInserted = 0;
+      const BATCH = 100;
+      for (let i = 0; i < entries.length; i += BATCH) {
+        const r = await upsertSims(entries.slice(i, i + BATCH));
+        totalInserted += r.inserted;
+      }
+
+      setImportResult({ inserted: totalInserted, skipped: entries.length - totalInserted, total: entries.length });
       await loadData();
     } catch (err: any) {
       console.error('Import error:', err);
@@ -216,15 +244,18 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
             <h1 className="text-2xl font-black text-gray-800 mb-6">Tổng quan</h1>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
               {[
-                { label: 'Tổng SIM', value: sims.length, color: 'bg-blue-500' },
-                { label: 'Đang bán', value: sims.filter(s => s.status === 'available').length, color: 'bg-green-500' },
-                { label: 'Đã bán', value: sims.filter(s => s.status === 'sold').length, color: 'bg-gray-500' },
-                { label: 'Đơn chờ', value: orders.filter(o => o.status === 'pending').length, color: 'bg-[#ee0033]' },
+                { label: 'Tổng SIM', value: sims.length, bg: 'bg-blue-50', text: 'text-blue-600', bar: 'bg-blue-500', icon: '📱' },
+                { label: 'Đang bán', value: sims.filter(s => s.status === 'available').length, bg: 'bg-green-50', text: 'text-green-600', bar: 'bg-green-500', icon: '✅' },
+                { label: 'Đã bán', value: sims.filter(s => s.status === 'sold').length, bg: 'bg-gray-50', text: 'text-gray-600', bar: 'bg-gray-400', icon: '📦' },
+                { label: 'Đơn chờ', value: orders.filter(o => o.status === 'pending').length, bg: 'bg-red-50', text: 'text-[#ee0033]', bar: 'bg-[#ee0033]', icon: '🔔' },
               ].map(stat => (
-                <div key={stat.label} className="bg-white rounded-2xl p-5 shadow-sm">
-                  <div className={`w-10 h-10 ${stat.color} rounded-xl mb-3`} />
-                  <div className="text-3xl font-black text-gray-800">{stat.value}</div>
-                  <div className="text-gray-500 text-sm">{stat.label}</div>
+                <div key={stat.label} className={`${stat.bg} rounded-2xl p-5 border border-white shadow-sm`}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xl">{stat.icon}</span>
+                    <div className={`w-2 h-8 ${stat.bar} rounded-full`} />
+                  </div>
+                  <div className={`text-3xl font-black ${stat.text}`}>{stat.value}</div>
+                  <div className="text-gray-500 text-sm mt-1">{stat.label}</div>
                 </div>
               ))}
             </div>
@@ -265,11 +296,23 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
 
             {/* Import result */}
             {importResult && (
-              <div className={`flex items-center gap-3 px-4 py-3 rounded-xl mb-4 text-sm font-semibold ${importResult.inserted > 0 ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-yellow-50 text-yellow-700 border border-yellow-200'}`}>
+              <div className={`flex items-center gap-3 px-4 py-3 rounded-xl mb-4 text-sm font-semibold border ${
+                importResult.inserted > 0
+                  ? 'bg-green-50 text-green-700 border-green-200'
+                  : importResult.total === 0
+                    ? 'bg-red-50 text-red-700 border-red-200'
+                    : 'bg-yellow-50 text-yellow-700 border-yellow-200'
+              }`}>
                 {importResult.inserted > 0 ? <CheckCircle size={18} /> : <AlertCircle size={18} />}
-                Import xong: <strong>{importResult.inserted}</strong> số mới / <strong>{importResult.total}</strong> số trong file
-                {importResult.skipped > 0 && <span className="text-gray-500">({importResult.skipped} trùng)</span>}
-                <button onClick={() => setImportResult(null)} className="ml-auto"><X size={14} /></button>
+                <span>
+                  {importResult.total === 0
+                    ? 'Không đọc được số điện thoại nào từ file'
+                    : <>Import xong: <strong>{importResult.inserted}</strong> số mới / <strong>{importResult.total}</strong> số trong file
+                      {importResult.skipped > 0 && <span className="font-normal text-current/70 ml-1">({importResult.skipped} số trùng → đã cập nhật)</span>}
+                    </>
+                  }
+                </span>
+                <button onClick={() => setImportResult(null)} className="ml-auto hover:opacity-60 transition-opacity"><X size={14} /></button>
               </div>
             )}
 
@@ -290,74 +333,91 @@ export default function AdminPanel({ onLogout }: AdminPanelProps) {
 
             <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
               <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
+                <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
-                    <th className="px-4 py-3 text-left">Số điện thoại</th>
-                    <th className="px-4 py-3 text-left">Loại chính</th>
-                    <th className="px-4 py-3 text-left">Mạng</th>
-                    <th className="px-4 py-3 text-left">Mệnh</th>
-                    <th className="px-4 py-3 text-left">Giá</th>
-                    <th className="px-4 py-3 text-left">Trạng thái</th>
-                    <th className="px-4 py-3 text-center">Xoá</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Số điện thoại</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Loại chính</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Mạng</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Mệnh</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Giá</th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wide">Trạng thái</th>
+                    <th className="px-4 py-3 text-center text-xs font-bold text-gray-500 uppercase tracking-wide">Xoá</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-100">
+                <tbody className="divide-y divide-gray-50">
                   {filteredSims.slice(0, 200).map(sim => (
-                    <tr key={sim.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 sim-number font-bold text-gray-800 whitespace-nowrap">
+                    <tr key={sim.id} className="hover:bg-red-50/30 transition-colors">
+                      <td className="px-4 py-2.5 sim-number font-black text-[#ee0033] whitespace-nowrap text-sm">
                         {formatPhoneDisplay(sim.normalizedPhone)}
                       </td>
-                      <td className="px-4 py-3 text-gray-600 max-w-[180px]">
-                        <div className="truncate text-xs">{sim.primaryType || sim.simTypes[0]}</div>
+                      <td className="px-4 py-2.5 max-w-[160px]">
+                        <div className="truncate text-xs text-gray-500">{sim.primaryType || sim.simTypes[0]}</div>
                       </td>
-                      <td className="px-4 py-3">
-                        <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${sim.network === '09' || sim.network === '08' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
-                          {sim.network || '03'}
+                      <td className="px-4 py-2.5">
+                        <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${
+                          sim.network === '09' ? 'bg-purple-100 text-purple-700' :
+                          sim.network === '08' ? 'bg-pink-100 text-pink-700' :
+                          'bg-blue-100 text-blue-700'
+                        }`}>
+                          {sim.network === '09' ? 'Viettel/MB' : sim.network === '08' ? 'Vina' : 'Mobi/VT'}
                         </span>
                       </td>
-                      <td className="px-4 py-3">
-                        <span className="text-xs font-semibold" style={{ color: sim.menhColor }}>{sim.menh}</span>
+                      <td className="px-4 py-2.5">
+                        <span className="text-xs font-bold px-2 py-0.5 rounded-full" style={{ color: sim.menhColor, backgroundColor: (sim.menhColor || '#999') + '18' }}>
+                          {sim.menh || '—'}
+                        </span>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-2.5">
                         {editPriceId === sim.id ? (
                           <div className="flex items-center gap-1">
                             <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)}
                               className="border rounded-lg px-2 py-1 text-xs w-24 focus:outline-none focus:border-[#ee0033]" autoFocus />
-                            <button onClick={() => saveSimPrice(sim)} className="text-green-500"><Save size={14} /></button>
-                            <button onClick={() => setEditPriceId(null)} className="text-gray-400"><X size={14} /></button>
+                            <button onClick={() => saveSimPrice(sim)} className="text-green-500 hover:text-green-700"><Save size={14} /></button>
+                            <button onClick={() => setEditPriceId(null)} className="text-gray-400 hover:text-gray-600"><X size={14} /></button>
                           </div>
                         ) : (
                           <button onClick={() => { setEditPriceId(sim.id); setEditPrice(sim.price?.replace(/[^0-9]/g, '') || ''); }}
-                            className="flex items-center gap-1 text-gray-700 hover:text-[#ee0033] font-semibold text-xs">
-                            {sim.price || '—'} <Edit2 size={11} className="opacity-40" />
+                            className="flex items-center gap-1 text-gray-800 hover:text-[#ee0033] font-bold text-xs group">
+                            {sim.price || '—'} <Edit2 size={10} className="opacity-0 group-hover:opacity-60 transition-opacity" />
                           </button>
                         )}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-2.5">
                         <select value={sim.status || 'available'} onChange={e => handleStatusChange(sim, e.target.value as any)}
-                          className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-[#ee0033]">
-                          <option value="available">Đang bán</option>
-                          <option value="reserved">Đang giữ</option>
-                          <option value="sold">Đã bán</option>
+                          className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-[#ee0033] bg-white cursor-pointer">
+                          <option value="available">🟢 Đang bán</option>
+                          <option value="reserved">🟡 Đang giữ</option>
+                          <option value="sold">⚫ Đã bán</option>
                         </select>
                       </td>
-                      <td className="px-4 py-3 text-center">
-                        <button onClick={() => handleDeleteSim(sim.id)} className="text-gray-300 hover:text-red-500 transition-colors">
-                          <Trash2 size={15} />
+                      <td className="px-4 py-2.5 text-center">
+                        <button onClick={() => handleDeleteSim(sim.id)} className="text-gray-200 hover:text-red-500 transition-colors">
+                          <Trash2 size={14} />
                         </button>
                       </td>
                     </tr>
                   ))}
                   {filteredSims.length === 0 && (
-                    <tr><td colSpan={7} className="text-center py-12 text-gray-400">
-                      {sims.length === 0 ? 'Kho trống. Import file Excel để bắt đầu.' : 'Không có SIM phù hợp.'}
+                    <tr><td colSpan={7} className="text-center py-16 text-gray-400">
+                      {sims.length === 0 ? (
+                        <div>
+                          <div className="text-5xl mb-3">📂</div>
+                          <div className="font-semibold text-gray-500 mb-1">Kho chưa có SIM</div>
+                          <div className="text-xs">Nhấn <strong>Import Excel</strong> để thêm SIM vào kho</div>
+                        </div>
+                      ) : (
+                        <div>
+                          <div className="text-3xl mb-2">🔍</div>
+                          <div className="text-gray-500 text-sm">Không có SIM phù hợp với bộ lọc</div>
+                        </div>
+                      )}
                     </td></tr>
                   )}
                 </tbody>
               </table>
               {filteredSims.length > 200 && (
-                <div className="px-4 py-3 bg-gray-50 text-xs text-gray-500 text-center">
-                  Hiển thị 200/{filteredSims.length} số. Dùng bộ lọc để thu hẹp.
+                <div className="px-4 py-3 bg-amber-50 border-t border-amber-100 text-xs text-amber-700 text-center font-semibold">
+                  Đang hiển thị 200/{filteredSims.length} số — dùng bộ lọc hoặc tìm kiếm để thu hẹp kết quả
                 </div>
               )}
             </div>
